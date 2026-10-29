@@ -1,10 +1,10 @@
-# 🧬 iMAT & Splicing Pathogenicity Interactive Analytics Dashboard
+# iMAT & Splicing Pathogenicity Interactive Analytics Dashboard
 
 A Python Shiny web application for interactive visualization, cohort statistical analysis, and live calculation of splicing pathogenicity and iMAT metabolic pipeline models.
 
 ---
 
-## 📌 Overview
+## Overview
 
 This repository provides an interactive analytics platform designed to visualize and process flux variability, target gene expression, and reporter-like pathway comparisons across matched sample cohorts (Control vs. Disease/AD). 
 
@@ -12,7 +12,7 @@ It connects directly with underlying analysis workflows and synthetic pipeline d
 
 ---
 
-## ✨ Key Features
+## Key Features
 
   - **Live Computed Analytics:** Dynamic evaluation of iMAT flux thresholds and corrected p-value limits.
   - **Interactive Visualizations (Plotly):**
@@ -26,7 +26,7 @@ It connects directly with underlying analysis workflows and synthetic pipeline d
 
 ---
 
-## 🛠️ Project Structure
+## Project Structure
 
 ```text
 ├── app.py                   # Main Python Shiny Application
