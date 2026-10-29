@@ -1,0 +1,3 @@
+[submodule "external_repo/bioinformatics-portfolio-projects"]
+	path = external_repo/bioinformatics-portfolio-projects
+	url = https://github.com/Bioinformatikci/bioinformatics-portfolio-projects.git
