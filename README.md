@@ -30,7 +30,6 @@ It connects directly with underlying analysis workflows and synthetic pipeline d
 
 ```text
 ├── app.py                   # Main Python Shiny Application
-├── requirements.txt         # Project dependencies
 ├── external_repo/           # Submodule / Forked core pipeline repository
 │   └── bioinformatics-portfolio-projects/
 └── README.md                # Project documentation
