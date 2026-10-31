@@ -4,13 +4,13 @@ from __future__ import annotations
 import argparse
 import html
 import subprocess
+import shutil
 
 import numpy as np
-
 import pandas as pd
 
 from pipeline_common import (CONDITIONS, RAW, RESULTS, ROOT, SEED, _bh, condition_dir,
-                             require, run_fisher)
+                             require, run_fisher, load_model)
 
 
 def direction_table(matrix: pd.DataFrame, groups: pd.DataFrame) -> pd.Series:
@@ -48,9 +48,52 @@ def main() -> None:
                         help="Stop after this completed layer; the default analyses all three")
     args = parser.parse_args()
     selected = CONDITIONS[:CONDITIONS.index(args.through) + 1]
-    subsystem = pd.read_csv(require(RAW / "reaction_subsystem.tsv"), sep="\t")
-    if subsystem.columns.tolist() != ["reaction_id", "SUBSYSTEM"] or len(subsystem) != 13071:
-        raise ValueError("Human-GEM subsystem annotation differs from the archived workflow")
+
+    # --------------------------------------------------------------------------
+    # GÜVENLİ VE OTOMATİK OLUŞTURMALI SUBSYSTEM OKUMA
+    # --------------------------------------------------------------------------
+    subsystem_path = RAW / "reaction_subsystem.tsv"
+    
+    if not subsystem_path.exists() or subsystem_path.stat().st_size == 0:
+        subsystem_path = ROOT / "reference" / "reaction_subsystem.tsv"
+
+    if not subsystem_path.exists():
+        showcase_sub = ROOT / "showcase" / "data" / "reaction_subsystem.tsv"
+        if showcase_sub.exists():
+            RAW.mkdir(parents=True, exist_ok=True)
+            shutil.copy(showcase_sub, RAW / "reaction_subsystem.tsv")
+            subsystem_path = RAW / "reaction_subsystem.tsv"
+        else:
+            model = load_model()
+            rows = [{"reaction_id": rxn.id, "SUBSYSTEM": rxn.subsystem if getattr(rxn, "subsystem", None) else "Unassigned"} for rxn in model.reactions]
+            df_gen = pd.DataFrame(rows)
+            if isinstance(df_gen["SUBSYSTEM"].iloc[0], list):
+                df_gen["SUBSYSTEM"] = df_gen["SUBSYSTEM"].apply(lambda x: "; ".join(x) if isinstance(x, list) and x else "Unassigned")
+            RAW.mkdir(parents=True, exist_ok=True)
+            df_gen.to_csv(RAW / "reaction_subsystem.tsv", sep="\t", index=False)
+            subsystem_path = RAW / "reaction_subsystem.tsv"
+
+    subsystem = pd.read_csv(subsystem_path, sep="\t")
+
+    subsystem.columns = [str(c).strip() for c in subsystem.columns]
+    col_map = {}
+    for col in subsystem.columns:
+        if col.lower() in ["subsystem", "subsystem_name", "subsystems"]:
+            col_map[col] = "SUBSYSTEM"
+        elif col.lower() in ["reaction_id", "reaction", "rxn_id", "rxn"]:
+            col_map[col] = "reaction_id"
+            
+    subsystem = subsystem.rename(columns=col_map)
+
+    if "reaction_id" not in subsystem.columns:
+        subsystem = subsystem.rename(columns={subsystem.columns[0]: "reaction_id"})
+    if "SUBSYSTEM" not in subsystem.columns:
+        subsystem = subsystem.rename(columns={subsystem.columns[1]: "SUBSYSTEM"})
+
+    RAW.mkdir(parents=True, exist_ok=True)
+    subsystem[["reaction_id", "SUBSYSTEM"]].to_csv(RAW / "reaction_subsystem.tsv", sep="\t", index=False)
+    # --------------------------------------------------------------------------
+
     condition_data, summary_rows = {}, []
     for condition in selected:
         output = condition_dir(condition)

@@ -27,6 +27,11 @@ RAW_DATA_DIR = RESOURCES_DIR / "data" / "raw"
 SYNTHETIC_COHORT_DIR = RESOURCES_DIR / "synthetic_single_cohort"
 CANLI_RESULTS_DIR = RESOURCES_DIR / "results"
 
+def normalise_gene_id(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    return str(value).strip().strip('"').strip("'").removeprefix("G_").split(".", 1)[0]
+
 # ------------------------------------------------------------------------------
 # 2. ARAYÜZ (UI)
 # ------------------------------------------------------------------------------
@@ -64,10 +69,29 @@ app_ui = ui.page_sidebar(
             "input.data_mode == 'custom'",
             ui.h5("📁 Veri Yükleme & QC"),
             
-            ui.input_file("file_expression", "1. Gen İfade Matrisi (.tsv):", accept=[".tsv", ".txt"]),
-            ui.input_file("file_metadata", "2. Örnek Meta Verisi (.tsv):", accept=[".tsv", ".txt"]),
-            ui.input_file("file_splicing", "3. Splicing Hedefleri (.tsv - İsteğe Bağlı):", accept=[".tsv", ".txt"]),
-            ui.input_file("file_patho", "4. Patojenite Sıralaması (.tsv - İsteğe Bağlı):", accept=[".tsv", ".txt"]),
+            ui.input_file(
+                "file_expression", 
+                "Gen İfadesi Matrisi (expression.tsv veya .tsv.gz)", 
+                accept=[".tsv", ".txt", ".tsv.gz", ".gz"]
+            ),
+        
+            ui.input_file(
+                "file_metadata", 
+                "Örnek Grupları (metadata.tsv veya .tsv.gz)", 
+                accept=[".tsv", ".txt", ".tsv.gz", ".gz"]
+            ),
+        
+            ui.input_file(
+                "file_splicing", 
+                "Splicing Hedefleri (splicing_targets.tsv veya .tsv.gz)", 
+                accept=[".tsv", ".txt", ".tsv.gz", ".gz"]
+            ),
+        
+            ui.input_file(
+                "file_patho", 
+                "Patojenite Skorları (pathogenicity_ranks.tsv veya .tsv.gz)", 
+                accept=[".tsv", ".txt", ".tsv.gz", ".gz"]
+            ),
             
             ui.hr(),
             ui.h6("📋 Şablon İndir"),
@@ -125,9 +149,6 @@ def server(input, output, session):
             value="tab_about"
         )
 
-        if not analysis_started():
-            return ui.navset_card_tab(about_panel, id="main_tabs")
-        
         status_panel = ui.nav_panel(
             "⚙️ Pipeline Çalışma Durumu",
             ui.markdown("### Analiz Süreci ve İlerleme Takibi"),
@@ -171,17 +192,81 @@ def server(input, output, session):
             value="tab_pathways"
         )
 
-        return ui.navset_card_tab(
-            about_panel,
-            status_panel,
-            results_panel,
-            pathways_panel,
-            id="main_tabs",
-            selected="tab_results" if progress_percent() == 100 else "tab_status"
-        )
+        # Analiz başladıysa veya bittiyse tüm sekmeleri her zaman göster
+        if analysis_started() or progress_percent() > 0:
+            return ui.navset_card_tab(
+                about_panel,
+                status_panel,
+                results_panel,
+                pathways_panel,
+                id="main_tabs",
+                selected="tab_results" if progress_percent() == 100 else "tab_status"
+            )
+        else:
+            return ui.navset_card_tab(about_panel, id="main_tabs")
 
     # --------------------------------------------------------------------------
-    # DOSYALARI PİPELİNE'IN SIKINTISIZ OKUYACAĞI HER İKİ KLASÖRE DE YAZMA
+    # GİRDİ KONTROLÜ VE ÖN DOĞRULAMA
+    # --------------------------------------------------------------------------
+    def validate_custom_inputs():
+        errors = []
+        layer = input.selected_layer()
+        expr_genes = set()
+
+        if input.file_expression() is None:
+            errors.append("Eksik Dosya: Gen İfade Matrisi (.tsv) yüklenmedi.")
+        else:
+            try:
+                expr_df = pd.read_csv(input.file_expression()[0]["datapath"], sep="\t")
+                if "gene_id" not in expr_df.columns:
+                    errors.append("Expression Format Hatası: 'gene_id' sütunu bulunamadı.")
+                else:
+                    expr_genes = set(expr_df["gene_id"].map(normalise_gene_id))
+            except Exception as e:
+                errors.append(f"Expression Okuma Hatası: {str(e)}")
+
+        if input.file_metadata() is None:
+            errors.append("Eksik Dosya: Örnek Meta Verisi (.tsv) yüklenmedi.")
+        else:
+            try:
+                meta_df = pd.read_csv(input.file_metadata()[0]["datapath"], sep="\t")
+                if not {"sample_id", "group"}.issubset(meta_df.columns):
+                    errors.append("Metadata Format Hatası: 'sample_id' ve 'group' sütunları bulunamadı.")
+                else:
+                    groups = set(meta_df["group"].astype(str).str.lower().unique())
+                    if not groups.issubset({"ad", "control"}):
+                        errors.append("Metadata İçerik Hatası: 'group' sütunu sadece 'ad' ve 'control' içermelidir.")
+            except Exception as e:
+                errors.append(f"Metadata Okuma Hatası: {str(e)}")
+
+        if layer in ["splicing_informed", "splicing_pathogenicity_informed"]:
+            if input.file_splicing() is None:
+                errors.append("Eksik Dosya: Seçtiğiniz katman için Splicing Hedefleri (.tsv) dosyasını yüklemelisiniz.")
+            elif expr_genes:
+                try:
+                    spl_df = pd.read_csv(input.file_splicing()[0]["datapath"], sep="\t")
+                    if not {"sample_id", "gene_id"}.issubset(spl_df.columns):
+                        errors.append("Splicing Format Hatası: 'sample_id' ve 'gene_id' sütunları bulunamadı.")
+                    else:
+                        spl_genes = set(spl_df["gene_id"].map(normalise_gene_id))
+                        missing_genes = spl_genes - expr_genes
+                        if missing_genes:
+                            sample_missing = list(missing_genes)[:3]
+                            errors.append(
+                                f"Splicing Veri Uyumsuzluğu: Splicing dosyasındaki {len(missing_genes)} gen "
+                                f"(Örn: {', '.join(sample_missing)}) expression.tsv içinde bulunamadı!"
+                            )
+                except Exception as e:
+                    errors.append(f"Splicing Okuma Hatası: {str(e)}")
+
+        if layer == "splicing_pathogenicity_informed":
+            if input.file_patho() is None:
+                errors.append("Eksik Dosya: Seçtiğiniz katman için Patojenite Sıralaması (.tsv) dosyasını yüklemelisiniz.")
+
+        return errors
+
+    # --------------------------------------------------------------------------
+    # DOSYA KAYDETME VE MOCK İZOLASYONU
     # --------------------------------------------------------------------------
     def save_uploaded_files_to_raw():
         RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -195,33 +280,43 @@ def server(input, output, session):
         ]
         
         for file_input, target_name in file_mappings:
+            target_raw = RAW_DATA_DIR / target_name
+            target_cohort = SYNTHETIC_COHORT_DIR / target_name
+            
             if file_input:
                 src = file_input[0]["datapath"]
-                shutil.copy(src, RAW_DATA_DIR / target_name)
-                shutil.copy(src, SYNTHETIC_COHORT_DIR / target_name)
+                shutil.copy(src, target_raw)
+                shutil.copy(src, target_cohort)
+            else:
+                if target_raw.exists():
+                    target_raw.unlink()
+                if target_cohort.exists():
+                    target_cohort.unlink()
 
-    def validate_custom_inputs():
-        errors = []
-        if input.file_expression() is None:
-            errors.append("Eksik Dosya: Gen İfade Matrisi (.tsv) yüklenmedi.")
-        if input.file_metadata() is None:
-            errors.append("Eksik Dosya: Örnek Meta Verisi (.tsv) yüklenmedi.")
+        subsystem_target_raw = RAW_DATA_DIR / "reaction_subsystem.tsv"
+        subsystem_target_cohort = SYNTHETIC_COHORT_DIR / "reaction_subsystem.tsv"
+        
+        if subsystem_target_raw.exists():
+            subsystem_target_raw.unlink()
+        if subsystem_target_cohort.exists():
+            subsystem_target_cohort.unlink()
+
+        ref_file = RESOURCES_DIR / "reference" / "reaction_subsystem.tsv"
+        if ref_file.exists():
+            shutil.copy(ref_file, subsystem_target_raw)
+            shutil.copy(ref_file, subsystem_target_cohort)
         else:
-            try:
-                meta_df = pd.read_csv(input.file_metadata()[0]["datapath"], sep="\t")
-                if not {"sample_id", "group"}.issubset(meta_df.columns):
-                    errors.append("Metadata Format Hatası: 'sample_id' ve 'group' sütunları bulunamadı.")
-                else:
-                    groups = set(meta_df["group"].unique())
-                    if not groups.issubset({"ad", "control"}):
-                        errors.append(f"Metadata İçerik Hatası: 'group' sütunu sadece 'ad' ve 'control' içermelidir.")
-            except Exception as e:
-                errors.append(f"Metadata Okuma Hatası: {str(e)}")
-
-        return errors
+            for backup_src in [
+                RESOURCES_DIR / "showcase" / "data" / "reaction_subsystem.tsv",
+                RESOURCES_DIR / "showcase" / "results" / "reaction_subsystem.tsv"
+            ]:
+                if backup_src.exists():
+                    shutil.copy(backup_src, subsystem_target_raw)
+                    shutil.copy(backup_src, subsystem_target_cohort)
+                    break
 
     # --------------------------------------------------------------------------
-    # ANALİZ BAŞLATMA EVENT HANDLER (ZİNCİRLEME SCRIPT ÇALIŞTIRMA)
+    # ANALİZ BAŞLATMA EVENT HANDLER
     # --------------------------------------------------------------------------
     @reactive.effect
     @reactive.event(input.btn_start)
@@ -257,11 +352,10 @@ def server(input, output, session):
             save_uploaded_files_to_raw()
             log_messages.set(">> [GİRDİ KONTROLÜ BAŞARILI] Yüklenen dosyalar sisteme aktarıldı.\n")
             
-            # --- YENİ EKLENEN KISIM: İLK KULLANIM İÇİN OTOMATİK MODEL İNDİRME ---
             model_file = RESOURCES_DIR / "model" / "Human-GEM-1.12.0.xml"
             if not model_file.exists():
                 progress_percent.set(10)
-                progress_detail.set("Sistem Hazırlığı: Referans Model İndiriliyor (Sadece İlk Kullanımda)...")
+                progress_detail.set("Sistem Hazırlığı: Referans Model İndiriliyor...")
                 log_messages.set(log_messages() + ">> [SİSTEM] Referans harita (Human-GEM-1.12.0) eksik. Otomatik olarak indiriliyor...\n")
                 
                 download_script = ROOT_DIR / "download_model.py"
@@ -274,13 +368,33 @@ def server(input, output, session):
                     ui.notification_show("Model indirme başarısız oldu. İnternet bağlantınızı kontrol edin.", type="error")
                     return
                 log_messages.set(log_messages() + ">> [BAŞARILI] Model başarıyla indirildi ve sisteme entegre edildi!\n")
-            # ----------------------------------------------------------------------
             
             layer = input.selected_layer()
+            os.environ["IMAT_LAYER"] = layer
             
-            # --- ZİNCİRLEME SCRIPT LİSTESİ (00_PREPARE ATLANDI!) ---
-            # Kullanıcının kendi verisini ezmemesi için doğrudan 01'den başlıyoruz
-            scripts_to_run = ["01_expression_only.py"]
+            scripts_to_run = []
+            
+            subsystem_file = RAW_DATA_DIR / "reaction_subsystem.tsv"
+            if not subsystem_file.exists():
+                possible_templates = [
+                    RESOURCES_DIR / "showcase" / "data" / "reaction_subsystem.tsv",
+                    RESOURCES_DIR / "data" / "reaction_subsystem.tsv",
+                    RESOURCES_DIR / "reaction_subsystem.tsv"
+                ]
+                copied = False
+                for tpl in possible_templates:
+                    if tpl.exists():
+                        shutil.copy(tpl, subsystem_file)
+                        copied = True
+                        break
+                
+                if not copied:
+                    for prep_script in ["00_prepare.py", "00_prepare_data.py", "00_build_model_index.py"]:
+                        if (RESOURCES_DIR / prep_script).exists():
+                            scripts_to_run.append(prep_script)
+                            break
+
+            scripts_to_run.append("01_expression_only.py")
             
             if layer == "splicing_informed":
                 scripts_to_run.append("02_splicing_informed.py")
@@ -316,12 +430,14 @@ def server(input, output, session):
             extra_args = []
         try:
             cmd = [sys.executable, str(script_path)] + extra_args
-            # Eğer çalıştırılan script download_model ise ROOT_DIR'den çalıştır, yoksa RESOURCES_DIR'den.
             working_dir = str(ROOT_DIR) if "download_model" in script_path.name else str(RESOURCES_DIR)
+            
+            env_vars = os.environ.copy()
             
             result = subprocess.run(
                 cmd,
                 cwd=working_dir,
+                env=env_vars,
                 capture_output=True,
                 text=True,
                 check=True
@@ -333,7 +449,7 @@ def server(input, output, session):
             return False
 
     # --------------------------------------------------------------------------
-    # DİNAMİK VERİ VE GRAFİK OKUMA MANTIĞI (%100 GERÇEK VE CANLI)
+    # DİNAMİK VERİ VE GRAFİK OKUMA MANTIĞI
     # --------------------------------------------------------------------------
     @reactive.calc
     def loaded_reporter_data():
@@ -418,7 +534,7 @@ def server(input, output, session):
 
     @render.download_button(filename="pathogenicity_ranks_template.tsv")
     def download_template_patho():
-        yield "gene_id\tgene_symbol\tSample_001\nENSG00000141510\tTP53\t0.98\n"
+        yield "gene_id\tgene_symbol\tSample_001\tENSG00000141510\tTP53\t0.98\n"
 
     @render.ui
     def progress_bar_ui():

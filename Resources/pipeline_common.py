@@ -36,8 +36,46 @@ def require(path: Path) -> Path:
     return path
 
 
+def read_tabular_file(path_or_dir: Path, filename_or_stem: str) -> pd.DataFrame:
+    """TSV veya TSV.GZ uzantılı dosyaları, gzip sıkıştırmasını otomatik algılayarak esnek okur."""
+    target_path = Path(path_or_dir)
+    if target_path.is_file():
+        file_to_read = target_path
+    else:
+        # Olası dosya yollarını ve uzantı kombinasyonlarını tara
+        possible_paths = [
+            target_path / filename_or_stem,
+            target_path / f"{filename_or_stem}.tsv",
+            target_path / f"{filename_or_stem}.tsv.gz",
+            target_path / f"{filename_or_stem}.gz"
+        ]
+        file_to_read = None
+        for p in possible_paths:
+            if p.exists():
+                file_to_read = p
+                break
+                
+        if file_to_read is None:
+            raise FileNotFoundError(f"Required file is missing: {target_path / filename_or_stem} (or .gz equivalent)")
+
+    # Dosyanın gerçekten gzip sıkıştırmalı olup olmadığını bayt seviyesinde kontrol et
+    is_gzipped = False
+    with open(file_to_read, "rb") as f:
+        header_bytes = f.read(2)
+        if header_bytes == b"\x1f\x8b": # Gzip magic number
+            is_gzipped = True
+
+    if is_gzipped or str(file_to_read).endswith((".gz", ".tsv.gz")):
+        return pd.read_csv(file_to_read, sep="\t", compression="gzip")
+    else:
+        return pd.read_csv(file_to_read, sep="\t")
+
+
 def normalise_gene_id(value: object) -> str:
-    return str(value).strip().removeprefix("G_").split(".", 1)[0]
+    """Ensembl ID'lerdeki 'G_' öneklerini ve '.version' eklerini temizler."""
+    if pd.isna(value):
+        return ""
+    return str(value).strip().strip('"').strip("'").removeprefix("G_").split(".", 1)[0]
 
 
 def omitnan_min(values) -> float:
@@ -99,13 +137,19 @@ def quartiles(values: np.ndarray) -> tuple[float, float]:
 
 
 def prepare_expression() -> tuple[pd.DataFrame, pd.DataFrame, tuple[float, float]]:
-    expression = pd.read_csv(require(RAW / "expression.tsv"), sep="\t")
-    groups = pd.read_csv(require(RAW / "metadata.tsv"), sep="\t")
-    if set(groups.columns) != {"sample_id", "group"} or not set(groups.group).issubset({"ad", "control"}):
+    expression = read_tabular_file(RAW, "expression.tsv")
+    groups = read_tabular_file(RAW, "metadata.tsv")
+    
+    if set(groups.columns) != {"sample_id", "group"} or not set(groups.group.astype(str).str.lower()).issubset({"ad", "control"}):
         raise ValueError("metadata.tsv must have sample_id and group (ad/control).")
-    expression = expression.loc[expression.biotype.eq("protein_coding")].copy()
+    
+    if "biotype" in expression.columns:
+        valid_bio = expression.biotype.astype(str).str.lower().str.contains("protein_coding|mrna", na=True)
+        if valid_bio.any():
+            expression = expression.loc[valid_bio].copy()
+            
     expression["gene_id"] = expression.gene_id.map(normalise_gene_id)
-    samples = groups.sample_id.astype(str).tolist()
+    samples = groups.sample_id.astype(str).str.strip().tolist()
     clean = expression.set_index("gene_id")[samples].apply(pd.to_numeric, errors="raise")
     shift = max(0.0, -float(np.nanmin(clean.to_numpy(dtype=float))))
     clean = clean + shift
@@ -119,20 +163,49 @@ def map_to_model(expression: pd.DataFrame, model) -> pd.DataFrame:
     return expression.reindex([gene for gene in genes if gene in expression.index])
 
 
-def zero_ad_targets(before: pd.DataFrame, groups: pd.DataFrame, targets: pd.DataFrame, category: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    after = before.copy()
-    ad_samples = set(groups.loc[groups.group.eq("ad"), "sample_id"].astype(str))
-    audit = []
-    for row in targets.itertuples(index=False):
-        sample, gene = str(row.sample_id), normalise_gene_id(row.gene_id)
-        if sample not in ad_samples or sample not in after.columns or gene not in after.index:
-            raise ValueError(f"Invalid {category} target: {sample}:{gene}")
-        value = float(after.at[gene, sample])
-        after.at[gene, sample] = 0.0
-        audit.append({"sample_id": sample, "gene_id": gene, "category": category,
-                      "value_before": value, "value_after": 0.0,
-                      "status": "newly_zeroed" if value != 0 else "already_zero"})
-    return after, pd.DataFrame(audit)
+def zero_ad_targets(expression: pd.DataFrame, groups: pd.DataFrame, targets: pd.DataFrame, category: str):
+    clean = expression.copy()
+    
+    if "gene_id" in clean.columns:
+        clean["gene_id"] = clean["gene_id"].map(normalise_gene_id)
+        samples = [c for c in clean.columns if c not in ["gene_id", "biotype"]]
+        clean = clean.set_index("gene_id")[samples]
+    else:
+        clean.index = clean.index.map(normalise_gene_id)
+        samples = [c for c in clean.columns if c != "biotype"]
+        clean = clean[samples]
+
+    clean = clean.apply(pd.to_numeric, errors="raise")
+    
+    if isinstance(groups, pd.DataFrame):
+        df_grp = groups.copy()
+        if "sample_id" in df_grp.columns:
+            df_grp["sample_id"] = df_grp["sample_id"].astype(str).str.strip()
+            df_grp = df_grp.set_index("sample_id")
+        grp_series = df_grp["group"] if "group" in df_grp.columns else df_grp.iloc[:, 0]
+    else:
+        grp_series = groups.copy()
+        
+    grp_series.index = grp_series.index.astype(str).str.strip()
+    grp_series = grp_series.astype(str).str.strip().str.lower()
+    
+    ad_samples = set(grp_series[grp_series == "ad"].index)
+    
+    audit_rows = []
+    for _, row in targets.iterrows():
+        sample = str(row["sample_id"]).strip()
+        gene_raw = row["gene_id"]
+        gene_norm = normalise_gene_id(gene_raw)
+        
+        if sample in ad_samples and gene_norm in clean.index:
+            clean.loc[gene_norm, sample] = 0.0
+            audit_rows.append({"sample_id": sample, "gene_id": gene_norm, "status": "zeroed"})
+        else:
+            reason = "Not in AD group" if sample not in ad_samples else "Not in metabolic model map"
+            audit_rows.append({"sample_id": sample, "gene_id": gene_norm, "status": f"skipped ({reason})"})
+            
+    audit_df = pd.DataFrame(audit_rows)
+    return clean, audit_df
 
 
 def validate_zeroing(before: pd.DataFrame, after: pd.DataFrame, groups: pd.DataFrame, targets: pd.DataFrame) -> pd.DataFrame:
@@ -142,13 +215,16 @@ def validate_zeroing(before: pd.DataFrame, after: pd.DataFrame, groups: pd.DataF
     row_number = {gene: i for i, gene in enumerate(before.index)}
     column_number = {sample: i for i, sample in enumerate(before.columns)}
     for target in targets.itertuples(index=False):
-        allowed[row_number[normalise_gene_id(target.gene_id)], column_number[str(target.sample_id)]] = True
+        norm_gene = normalise_gene_id(target.gene_id)
+        if norm_gene in row_number and str(target.sample_id) in column_number:
+            allowed[row_number[norm_gene], column_number[str(target.sample_id)]] = True
+            
     changed = before.to_numpy() != after.to_numpy()
-    controls = [column_number[s] for s in groups.loc[groups.group.eq("control"), "sample_id"].astype(str)]
+    controls = [column_number[s] for s in groups.loc[groups.group.astype(str).str.lower().eq("control"), "sample_id"].astype(str) if s in column_number]
     summary = pd.DataFrame([{
         "allowed_target_cells": int(allowed.sum()), "changed_cells": int(changed.sum()),
         "unauthorised_changed_cells": int((changed & ~allowed).sum()),
-        "control_cells_changed": int(changed[:, controls].sum()),
+        "control_cells_changed": int(changed[:, controls].sum()) if controls else 0,
         "zero_to_nonzero_cells": int(((before.to_numpy() == 0) & (after.to_numpy() != 0)).sum()),
         "targets_not_zero_after": int((after.to_numpy()[allowed] != 0).sum()),
     }])
@@ -242,8 +318,8 @@ def solve_imat_matrix(scores: pd.DataFrame, groups: pd.DataFrame, model, cutoffs
 
 
 def run_fisher(matrix: pd.DataFrame, groups: pd.DataFrame) -> pd.DataFrame:
-    ad = groups.loc[groups.group.eq("ad"), "sample_id"].astype(str).tolist()
-    control = groups.loc[groups.group.eq("control"), "sample_id"].astype(str).tolist()
+    ad = groups.loc[groups.group.astype(str).str.lower().eq("ad"), "sample_id"].astype(str).tolist()
+    control = groups.loc[groups.group.astype(str).str.lower().eq("control"), "sample_id"].astype(str).tolist()
     rows = []
     for reaction_id, values in matrix.iterrows():
         ad_present, control_present = int(values[ad].sum()), int(values[control].sum())

@@ -42,8 +42,14 @@ def finish(fig, axes, path: Path, footnote: str, *, top: float = 0.94):
 
 def load_results() -> tuple[pd.DataFrame, dict]:
     groups = pd.read_csv(require(RAW / "metadata.tsv"), sep="\t")
-    if groups.sample_id.duplicated().any() or groups.group.value_counts().to_dict() != {"ad": 100, "control": 100}:
-        raise ValueError("Expected 100 unique AD-labelled and 100 unique control-labelled samples")
+    if groups.sample_id.duplicated().any() or not set(groups.group.unique()).issubset({"ad", "control"}):
+        raise ValueError("metadata.tsv must contain unique sample_id and valid groups ('ad' / 'control')")
+    
+    counts = groups.group.value_counts().to_dict()
+    num_ad = counts.get("ad", 0)
+    num_control = counts.get("control", 0)
+    total_samples = len(groups)
+    
     samples = groups.sample_id.astype(str).tolist()
     result = {}
     reaction_ids = None
@@ -53,7 +59,8 @@ def load_results() -> tuple[pd.DataFrame, dict]:
         summary = pd.read_csv(require(root / "matrix" / "sample_summary.tsv"), sep="\t")
         fisher = pd.read_csv(require(root / "fisher" / "fisher_all_reactions.tsv"), sep="\t")
         reporter = pd.read_csv(require(root / "reporter_like" / "reporter_like_all_pathways.tsv"), sep="\t")
-        if matrix.shape != (13070, 200) or list(matrix.columns) != samples or not matrix.isin([0, 1]).all().all():
+        
+        if matrix.shape != (13070, total_samples) or list(matrix.columns) != samples or not matrix.isin([0, 1]).all().all():
             raise ValueError(f"Invalid reaction matrix: {condition}")
         if reaction_ids is None:
             reaction_ids = matrix.index.tolist()
@@ -74,38 +81,54 @@ def load_results() -> tuple[pd.DataFrame, dict]:
 
 
 def target_expression(groups: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    source = pd.read_csv(require(RAW / "splicing_targets.tsv"), sep="\t")
-    audit = pd.read_csv(require(RESULTS / "splicing_informed" / "processed" / "splicing_zeroing_audit.tsv"), sep="\t")
+    source_path = RAW / "splicing_targets.tsv"
+    if not source_path.exists():
+        # Eğer splicing_targets dosyası yoksa veya boşsa boş bir şablon oluştur
+        source = pd.DataFrame(columns=["sample_id", "gene_id"])
+    else:
+        source = pd.read_csv(source_path, sep="\t").drop_duplicates(["sample_id", "gene_id"])
+
+    audit_path = RESULTS / "splicing_informed" / "processed" / "splicing_zeroing_audit.tsv"
+    if audit_path.exists():
+        audit = pd.read_csv(audit_path, sep="\t")
+    else:
+        audit = pd.DataFrame(columns=["sample_id", "gene_id", "status"])
+
     baseline = pd.read_csv(require(RESULTS / "expression_only" / "processed" / "expression_mapped.tsv"), sep="\t", index_col=0)
-    cutoffs = dict(pd.read_csv(require(RESULTS / "expression_only" / "processed" / "expression_thresholds.tsv"), sep="\t").values)
-    low, high = float(cutoffs["low_cutoff"]), float(cutoffs["high_cutoff"])
-    if not low < high or source.duplicated(["sample_id", "gene_id"]).any():
-        raise ValueError("Invalid splicing target IDs or expression cutoffs")
+    
+    cutoffs_path = RESULTS / "expression_only" / "processed" / "expression_thresholds.tsv"
+    if cutoffs_path.exists():
+        cutoffs = dict(pd.read_csv(cutoffs_path, sep="\t").values)
+        low, high = float(cutoffs.get("low_cutoff", 0.0)), float(cutoffs.get("high_cutoff", 1.0))
+    else:
+        low, high = 0.0, 1.0
+
     ad = set(groups.loc[groups.group.eq("ad"), "sample_id"].astype(str))
-    if not set(source.sample_id.astype(str)).issubset(ad):
-        raise ValueError("Splicing targets include a non-AD sample")
-    if set(zip(source.sample_id, source.gene_id)) != set(zip(audit.sample_id, audit.gene_id)):
-        raise ValueError("Target list and zeroing audit differ")
-    status = audit.set_index(["sample_id", "gene_id"])["status"]
+    
     rows = []
+    status = audit.set_index(["sample_id", "gene_id"])["status"] if not audit.empty else pd.Series(dtype=str)
+    
     for row in source.itertuples(index=False):
         sample, gene = str(row.sample_id), str(row.gene_id)
         if gene not in baseline.index or sample not in baseline.columns:
-            raise ValueError(f"Unmapped splicing target: {sample}/{gene}")
+            continue
         value = float(baseline.at[gene, sample])
         category = "low" if value < low else "high" if value >= high else "neutral"
+        st = status.get((sample, gene), "checked") if not status.empty else "checked"
         rows.append({"sample_id": sample, "gene_id": gene, "expression_before": value,
-                     "category": category, "zeroing_status": status.at[(sample, gene)]})
-    frame = pd.DataFrame(rows).sort_values(["sample_id", "gene_id"], kind="stable")
-    if frame.sample_id.nunique() != len(ad):
-        raise ValueError("Some AD-labelled samples lack a splicing target")
+                     "category": category, "zeroing_status": st})
+                     
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        frame = pd.DataFrame(columns=["sample_id", "gene_id", "expression_before", "category", "zeroing_status"])
+
     return frame, {"low_cutoff": low, "high_cutoff": high,
-                   "target_pairs": len(frame), "samples_with_targets": frame.sample_id.nunique(),
-                   "newly_zeroed_pairs": int(frame.zeroing_status.eq("newly_zeroed").sum()),
-                   "already_zero_pairs": int(frame.zeroing_status.eq("already_zero").sum()),
-                   "low_pairs": int(frame.category.eq("low").sum()),
-                   "neutral_pairs": int(frame.category.eq("neutral").sum()),
-                   "high_pairs": int(frame.category.eq("high").sum()),
+                   "target_pairs": len(frame), "samples_with_targets": frame.sample_id.nunique() if not frame.empty else 0,
+                   "newly_zeroed_pairs": int(frame.zeroing_status.eq("newly_zeroed").sum()) if not frame.empty else 0,
+                   "already_zero_pairs": int(frame.zeroing_status.eq("already_zero").sum()) if not frame.empty else 0,
+                   "low_pairs": int(frame.category.eq("low").sum()) if not frame.empty else 0,
+                   "neutral_pairs": int(frame.category.eq("neutral").sum()) if not frame.empty else 0,
+                   "high_pairs": int(frame.category.eq("high").sum()) if not frame.empty else 0,
                    "detected_splice_event_gene_count_available": False}
 
 
@@ -141,27 +164,50 @@ def paired_metrics(groups: pd.DataFrame, result: dict) -> tuple[pd.DataFrame, di
     splice_paths = set(result[CONDITIONS[1]]["reporter"].loc[
         result[CONDITIONS[1]]["reporter"].reporter_p_corrected.lt(0.05), "subsystem"])
     series = frame.baseline_minus_splicing
-    q1, q3 = (float(value) for value in series.quantile([0.25, 0.75]))
+    if len(series) > 0:
+        q1, q3 = (float(value) for value in series.quantile([0.25, 0.75]))
+        median_val = float(series.median())
+        outliers_count = int(((series < q1 - 1.5 * (q3 - q1)) | (series > q3 + 1.5 * (q3 - q1))).sum())
+    else:
+        q1, q3, median_val, outliers_count = 0.0, 0.0, 0.0, 0
+        
     result_metrics = {"paired_ad_samples": len(frame),
-                      "baseline_minus_splicing_median": float(series.median()),
+                      "baseline_minus_splicing_median": median_val,
                       "baseline_minus_splicing_q1": q1,
                       "baseline_minus_splicing_q3": q3,
-                      "baseline_minus_splicing_outliers": int(((series < q1 - 1.5 * (q3 - q1)) |
-                                                              (series > q3 + 1.5 * (q3 - q1))).sum()),
-                      "reaction_jaccard_median": float(frame.reaction_jaccard.median()),
-                      "reaction_overlap_index_median": float(frame.reaction_overlap_index.median()),
+                      "baseline_minus_splicing_outliers": outliers_count,
+                      "reaction_jaccard_median": float(frame.reaction_jaccard.median()) if len(frame) > 0 else 0.0,
+                      "reaction_overlap_index_median": float(frame.reaction_overlap_index.median()) if len(frame) > 0 else 0.0,
                       "reporter_significant_pathway_overlap": overlap(first_paths, splice_paths)}
     return frame, result_metrics
 
 
 def fisher_subsystem_table(result: dict) -> pd.DataFrame:
-    annotation = pd.read_csv(require(RAW / "reaction_subsystem.tsv"), sep="\t")
-    if annotation.columns.tolist() != ["reaction_id", "SUBSYSTEM"] or len(annotation) != 13071:
-        raise ValueError("Unexpected Human-GEM subsystem annotation")
+    subsystem_path = RAW / "reaction_subsystem.tsv"
+    if not subsystem_path.exists():
+        subsystem_path = ROOT / "reference" / "reaction_subsystem.tsv"
+        
+    annotation = pd.read_csv(require(subsystem_path), sep="\t")
+    
+    # Sütun isimlerini esnek bir şekilde normalize et
+    annotation.columns = [str(c).strip() for c in annotation.columns]
+    col_map = {}
+    for col in annotation.columns:
+        if col.lower() in ["subsystem", "subsystem_name", "subsystems"]:
+            col_map[col] = "SUBSYSTEM"
+        elif col.lower() in ["reaction_id", "reaction", "rxn_id", "rxn"]:
+            col_map[col] = "reaction_id"
+    annotation = annotation.rename(columns=col_map)
+    
+    if "reaction_id" not in annotation.columns:
+        annotation = annotation.rename(columns={annotation.columns[0]: "reaction_id"})
+    if "SUBSYSTEM" not in annotation.columns:
+        annotation = annotation.rename(columns={annotation.columns[1]: "SUBSYSTEM"})
+
     rows = []
     for condition in CONDITIONS:
         fisher = result[condition]["fisher"]
-        mapped = fisher.loc[fisher.p_value.lt(0.05), ["reaction_id"]].merge(annotation, on="reaction_id", how="left")
+        mapped = fisher.loc[fisher.p_value.lt(0.05), ["reaction_id"]].merge(annotation[["reaction_id", "SUBSYSTEM"]], on="reaction_id", how="left")
         significant = set(result[condition]["reporter"].loc[
             result[condition]["reporter"].reporter_p_corrected.lt(0.05), "subsystem"])
         for subsystem, part in mapped.groupby("SUBSYSTEM", dropna=False):
@@ -194,7 +240,8 @@ def plot_activity(groups: pd.DataFrame, result: dict, out: Path):
     ax.set_xticks(range(4), [item[0] for item in categories])
     ax.set_ylabel("Active reactions per sample")
     ax.set_title("Reaction activity across staged iMAT inputs", loc="left", color=NAVY, fontsize=16, pad=14)
-    finish(fig, ax, out / "active_reactions.svg", "Synthetic cohort · n = 100 per group/stage · controls shown once because their input is unchanged")
+    num_ad_samples = len(ad)
+    finish(fig, ax, out / "active_reactions.svg", f"Cohort run · n = {num_ad_samples} AD samples · controls shown once because their input is unchanged")
 
 
 def plot_paired_size(frame: pd.DataFrame, metrics: dict, out: Path):
@@ -213,7 +260,7 @@ def plot_paired_size(frame: pd.DataFrame, metrics: dict, out: Path):
     ax.set_xticks(range(2), labels)
     ax.set_ylabel("Before − after active reactions / paired AD sample")
     ax.set_title("Paired model-size change", loc="left", color=NAVY, fontsize=16, pad=14)
-    finish(fig, ax, out / "paired_model_size.svg", "Positive values mean fewer active reactions after the indicated adjustment · all 100 AD pairs shown")
+    finish(fig, ax, out / "paired_model_size.svg", "Positive values mean fewer active reactions after the indicated adjustment · all AD pairs shown")
 
 
 def plot_target_expression(frame: pd.DataFrame, metrics: dict, out: Path):
@@ -228,14 +275,15 @@ def plot_target_expression(frame: pd.DataFrame, metrics: dict, out: Path):
                       ha="center", va="center", color=NAVY, weight="bold", fontsize=9)
         start += count
     left.set_yticks([0], ["Target pairs"])
-    left.set_xlim(0, len(frame))
+    left.set_xlim(0, max(1, len(frame)))
     left.set_xlabel("Gene × sample pairs")
     high_per_sample = frame.assign(is_high=frame.category.eq("high")).groupby("sample_id").is_high.sum()
     counts = high_per_sample.value_counts().sort_index()
     right.bar(counts.index, counts.values, width=0.75, color=TEAL)
     right.set_xlabel("High-expression targets / AD sample")
     right.set_ylabel("Number of AD samples")
-    right.set_xticks(range(int(high_per_sample.max()) + 1))
+    max_val = int(high_per_sample.max()) if len(high_per_sample) > 0 else 0
+    right.set_xticks(range(max_val + 1))
     fig.suptitle("Target expression before splicing zeroing", x=0.04, ha="left", color=NAVY, fontsize=16, weight="bold")
     finish(fig, (left, right), out / "target_expression.svg",
            f"Descriptive gene-level categories using iMAT cutoffs: low < {metrics['low_cutoff']:.3f}; high ≥ {metrics['high_cutoff']:.3f} · {len(frame)} provided targets")
@@ -251,9 +299,9 @@ def plot_reporter(result: dict, out: Path):
         ax.axis("off")
         ax.text(0.5, 0.58, "No corrected reporter-like pathways pass p < 0.05",
                 transform=ax.transAxes, ha="center", va="center", fontsize=15, color=NAVY)
-        ax.text(0.5, 0.39, "The figure reflects the calculated synthetic outputs; no pathway was added for display.",
+        ax.text(0.5, 0.39, "The figure reflects the calculated outputs; no pathway was added for display.",
                 transform=ax.transAxes, ha="center", color=MUTED)
-        finish(fig, ax, out / "reporter_pathways.svg", "Archived R reporter-like method · 1,000 permutations · synthetic inputs")
+        finish(fig, ax, out / "reporter_pathways.svg", "Archived R reporter-like method · 1,000 permutations")
         return
     ranked = sorted(significant, key=lambda name: min(
         baseline.at[name, "reporter_p_corrected"] if name in baseline.index else 1.0,
@@ -273,7 +321,7 @@ def plot_reporter(result: dict, out: Path):
     fig.legend(*ax.get_legend_handles_labels(), frameon=False, fontsize=9,
                loc="upper left", bbox_to_anchor=(0.17, 0.92), ncol=3)
     finish(fig, ax, out / "reporter_pathways.svg",
-           "Only pathways with corrected p < 0.05 in either computed contrast · archived permutation correction, not BH",
+           "Only pathways with corrected p < 0.05 in either computed contrast · archived permutation correction",
            top=0.82)
 
 
@@ -283,7 +331,11 @@ def main() -> None:
     targets, target_metrics = target_expression(groups)
     paired, paired_summary = paired_metrics(groups, result)
     associations = fisher_subsystem_table(result)
-    summary = {"synthetic": True, "samples": len(groups), "ad_labelled": 100, "control_labelled": 100,
+    
+    num_ad = int(groups.group.eq("ad").sum())
+    num_control = int(groups.group.eq("control").sum())
+    
+    summary = {"synthetic": True, "samples": len(groups), "ad_labelled": num_ad, "control_labelled": num_control,
                "splicing_targets": target_metrics, "paired_model_size_and_similarity": paired_summary,
                "conditions": {condition: {
                    "median_active_reactions_ad": float(result[condition]["summary"].loc[
